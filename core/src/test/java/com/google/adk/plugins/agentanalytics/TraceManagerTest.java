@@ -227,4 +227,35 @@ public class TraceManagerTest {
     traceManager.clearStack();
     assertTrue(traceManager.getCurrentSpanAndParent().spanId().isEmpty());
   }
+
+  @Test
+  public void initTraceIfNeeded_setsRootAgentNameFromContext() {
+    assertEquals(TraceManager.DEFAULT_ROOT_AGENT_NAME, traceManager.getRootAgentName());
+    traceManager.initTraceIfNeeded(mockContext);
+    assertEquals("test-agent", traceManager.getRootAgentName());
+  }
+
+  @Test
+  public void initTraceIfNeeded_nullAgent_keepsSentinel() {
+    InvocationContext ctx = mock(InvocationContext.class);
+    when(ctx.agent()).thenReturn(null);
+    traceManager.initTraceIfNeeded(ctx);
+    assertEquals(TraceManager.DEFAULT_ROOT_AGENT_NAME, traceManager.getRootAgentName());
+  }
+
+  @Test
+  public void initTrace_nullRootAgent_keepsSentinelWithoutThrowing() {
+    // rootAgent() may be null (e.g. workflow-driven callbacks with no resolved root); initTrace
+    // must
+    // guard on it directly rather than NPE. Called directly (not via initTraceIfNeeded, whose
+    // try/catch would otherwise mask a missing rootAgent null-check).
+    BaseAgent agentWithNullRoot = mock(BaseAgent.class);
+    when(agentWithNullRoot.rootAgent()).thenReturn(null);
+    InvocationContext ctx = mock(InvocationContext.class);
+    when(ctx.agent()).thenReturn(agentWithNullRoot);
+
+    traceManager.initTrace(ctx);
+
+    assertEquals(TraceManager.DEFAULT_ROOT_AGENT_NAME, traceManager.getRootAgentName());
+  }
 }
