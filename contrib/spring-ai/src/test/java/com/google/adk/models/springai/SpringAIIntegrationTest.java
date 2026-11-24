@@ -15,23 +15,55 @@
  */
 package com.google.adk.models.springai;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
+import com.anthropic.client.AnthropicClient;
+import com.anthropic.client.AnthropicClientAsync;
+import com.anthropic.core.JsonValue;
+import com.anthropic.core.RequestOptions;
+import com.anthropic.core.http.Headers;
+import com.anthropic.core.http.HttpResponseFor;
+import com.anthropic.models.messages.ContentBlock;
+import com.anthropic.models.messages.ContentBlockParam;
+import com.anthropic.models.messages.DirectCaller;
+import com.anthropic.models.messages.Message;
+import com.anthropic.models.messages.MessageCreateParams;
 import com.anthropic.models.messages.MessageDeltaUsage;
+import com.anthropic.models.messages.RedactedThinkingBlock;
+import com.anthropic.models.messages.StopReason;
+import com.anthropic.models.messages.ThinkingBlock;
+import com.anthropic.models.messages.ToolUseBlock;
+import com.anthropic.models.messages.Usage;
+import com.anthropic.services.blocking.MessageService;
 import com.google.adk.agents.LlmAgent;
 import com.google.adk.agents.RunConfig;
 import com.google.adk.events.Event;
+import com.google.adk.models.LlmRequest;
 import com.google.adk.models.springai.integrations.tools.WeatherTool;
 import com.google.adk.runner.InMemoryRunner;
 import com.google.adk.runner.Runner;
 import com.google.adk.sessions.Session;
 import com.google.adk.tools.FunctionTool;
 import com.google.genai.types.Content;
+import com.google.genai.types.FunctionResponse;
 import com.google.genai.types.GenerateContentResponseUsageMetadata;
 import com.google.genai.types.Part;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.mockito.ArgumentCaptor;
+import org.springframework.ai.anthropic.AnthropicChatModel;
+import org.springframework.ai.anthropic.AnthropicChatOptions;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.metadata.ChatGenerationMetadata;
 import org.springframework.ai.chat.metadata.ChatResponseMetadata;
@@ -425,5 +457,139 @@ class SpringAIIntegrationTest {
         return Flux.just(response);
       }
     };
+  }
+
+  private static final String SIGNATURE = "opaque-test-signature";
+  private static final String REDACTED_DATA = "opaque-test-redacted-data";
+  private static final Content USER =
+      Content.builder().role("user").parts(Part.fromText("What is the weather?")).build();
+
+  private AnthropicChatModel model;
+  private MessageService.WithRawResponse messages;
+
+  @BeforeEach
+  void setUp() {
+    AnthropicClient client = mock(AnthropicClient.class);
+    MessageService service = mock(MessageService.class);
+    messages = mock(MessageService.WithRawResponse.class);
+    when(client.messages()).thenReturn(service);
+    when(service.withRawResponse()).thenReturn(messages);
+    model =
+        AnthropicChatModel.builder()
+            .anthropicClient(client)
+            .anthropicClientAsync(mock(AnthropicClientAsync.class))
+            .options(
+                AnthropicChatOptions.builder()
+                    .model("claude-sonnet-4-5")
+                    .maxTokens(4096)
+                    .thinkingEnabled(1024)
+                    .build())
+            .build();
+  }
+
+  @ParameterizedTest
+  @CsvSource({
+    "false, 'Let me check the weather.'",
+    "true, 'Let me check the weather.'",
+    "false, ''",
+    "true, ''"
+  })
+  void bridgeReplaysThinkingBlocks(boolean serializeEvent, String thinking) {
+    respondWithThinkingAndToolUse(thinking);
+    SpringAI bridge = new SpringAI((ChatModel) model, "claude-sonnet-4-5");
+    Content assistant =
+        bridge
+            .generateContent(LlmRequest.builder().contents(List.of(USER)).build(), false)
+            .blockingSingle()
+            .content()
+            .orElseThrow();
+    if (serializeEvent) {
+      Event event = Event.builder().id("test-event").author("assistant").content(assistant).build();
+      assistant = Event.fromJson(event.toJson()).content().orElseThrow();
+    }
+    Content result =
+        Content.builder()
+            .role("user")
+            .parts(
+                Part.builder()
+                    .functionResponse(
+                        FunctionResponse.builder()
+                            .id("tool_1")
+                            .name("get_weather")
+                            .response(Map.of("weather", "sunny"))
+                            .build())
+                    .build())
+            .build();
+
+    bridge
+        .generateContent(
+            LlmRequest.builder().contents(List.of(USER, assistant, result)).build(), false)
+        .blockingSingle();
+
+    assertReplayedBlocks(thinking);
+  }
+
+  @SuppressWarnings("unchecked")
+  private void respondWithThinkingAndToolUse(String thinking) {
+    Message response =
+        Message.builder()
+            .id("msg_test")
+            .container(Optional.empty())
+            .model("claude-sonnet-4-5")
+            .stopDetails(Optional.empty())
+            .stopReason(StopReason.TOOL_USE)
+            .stopSequence(Optional.empty())
+            .usage(
+                Usage.builder()
+                    .inputTokens(10)
+                    .outputTokens(20)
+                    .cacheCreation(Optional.empty())
+                    .cacheCreationInputTokens(Optional.empty())
+                    .cacheReadInputTokens(Optional.empty())
+                    .inferenceGeo(Optional.empty())
+                    .outputTokensDetails(Optional.empty())
+                    .serverToolUse(Optional.empty())
+                    .serviceTier(Optional.empty())
+                    .build())
+            .content(
+                List.of(
+                    ContentBlock.ofThinking(
+                        ThinkingBlock.builder().thinking(thinking).signature(SIGNATURE).build()),
+                    ContentBlock.ofRedactedThinking(
+                        RedactedThinkingBlock.builder().data(REDACTED_DATA).build()),
+                    ContentBlock.ofToolUse(
+                        ToolUseBlock.builder()
+                            .id("tool_1")
+                            .name("get_weather")
+                            .caller(DirectCaller.builder().build())
+                            .input(JsonValue.from(Map.of("city", "Paris")))
+                            .build())))
+            .build();
+    HttpResponseFor<Message> rawResponse = mock(HttpResponseFor.class);
+    when(rawResponse.parse()).thenReturn(response);
+    when(rawResponse.headers()).thenReturn(Headers.builder().build());
+    when(messages.create(any(MessageCreateParams.class), any(RequestOptions.class)))
+        .thenReturn(rawResponse);
+  }
+
+  private void assertReplayedBlocks(String thinking) {
+    ArgumentCaptor<MessageCreateParams> requests =
+        ArgumentCaptor.forClass(MessageCreateParams.class);
+    verify(messages, times(2)).create(requests.capture(), any(RequestOptions.class));
+    MessageCreateParams nextRequest = requests.getAllValues().get(1);
+    assertThat(nextRequest.messages()).hasSize(3);
+    List<ContentBlockParam> blocks = nextRequest.messages().get(1).content().asBlockParams();
+    assertThat(blocks.stream().filter(ContentBlockParam::isToolUse).toList())
+        .singleElement()
+        .satisfies(block -> assertThat(block.asToolUse().id()).isEqualTo("tool_1"));
+    assertThat(blocks)
+        .as("Assistant request must retain thinking, redacted_thinking, and tool_use in order")
+        .hasSize(3);
+    assertThat(blocks.get(0).isThinking()).isTrue();
+    assertThat(blocks.get(0).asThinking().thinking()).isEqualTo(thinking);
+    assertThat(blocks.get(0).asThinking().signature()).isEqualTo(SIGNATURE);
+    assertThat(blocks.get(1).isRedactedThinking()).isTrue();
+    assertThat(blocks.get(1).asRedactedThinking().data()).isEqualTo(REDACTED_DATA);
+    assertThat(blocks.get(2).isToolUse()).isTrue();
   }
 }
